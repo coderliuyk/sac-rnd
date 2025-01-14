@@ -64,43 +64,42 @@ class Config:
 
 
 class RNDTrainState(TrainState):
-    rms: RunningMeanStd
-
+    rms: RunningMeanStd  # 用于跟踪奖励的均值和标准差
 
 class CriticTrainState(TrainState):
-    target_params: FrozenDict
+    target_params: FrozenDict  # 评论家的目标网络参数
 
-
-# RND functions
+# RND 函数
 def rnd_bonus(
-        rnd: RNDTrainState,
-        state: jax.Array,
-        action: jax.Array
+        rnd: RNDTrainState,  # RND 训练状态
+        state: jax.Array,    # 当前状态
+        action: jax.Array    # 当前动作
 ) -> jax.Array:
+    # 通过 RND 模型预测和目标网络计算
     pred, target = rnd.apply_fn(rnd.params, state, action)
-    # [batch_size, embedding_dim]
+    # 计算 RND 奖励（bonus），即预测和目标之间的均方误差，归一化为标准差
     bonus = jnp.sum((pred - target) ** 2, axis=1) / rnd.rms.std
     return bonus
 
-
 def update_rnd(
-        key: jax.random.PRNGKey,
-        rnd: RNDTrainState,
-        batch: Dict[str, jax.Array],
-        metrics: Metrics
+        key: jax.random.PRNGKey,  # 随机数种子
+        rnd: RNDTrainState,        # RND 训练状态
+        batch: Dict[str, jax.Array],  # 批量数据，包括状态和动作
+        metrics: Metrics            # 记录指标的对象
 ) -> Tuple[jax.random.PRNGKey, RNDTrainState, Metrics]:
     def rnd_loss_fn(params):
+        # 计算 RND 的损失
         pred, target = rnd.apply_fn(params, batch["states"], batch["actions"])
-        raw_loss = ((pred - target) ** 2).sum(axis=1)
-
-        new_rms = rnd.rms.update(raw_loss)
-        loss = raw_loss.mean(axis=0)
+        raw_loss = ((pred - target) ** 2).sum(axis=1)  # 原始损失
+        new_rms = rnd.rms.update(raw_loss)  # 更新均值和标准差
+        loss = raw_loss.mean(axis=0)  # 计算平均损失
         return loss, new_rms
 
+    # 计算损失和梯度
     (loss, new_rms), grads = jax.value_and_grad(rnd_loss_fn, has_aux=True)(rnd.params)
-    new_rnd = rnd.apply_gradients(grads=grads).replace(rms=new_rms)
+    new_rnd = rnd.apply_gradients(grads=grads).replace(rms=new_rms)  # 更新 RND 状态
 
-    # log rnd bonus for random actions
+    # 记录随机动作的 RND 奖励
     key, actions_key = jax.random.split(key)
     random_actions = jax.random.uniform(actions_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0)
     new_metrics = metrics.update({
@@ -111,28 +110,28 @@ def update_rnd(
     })
     return key, new_rnd, new_metrics
 
-
 def update_actor(
-        key: jax.random.PRNGKey,
-        actor: TrainState,
-        rnd: RNDTrainState,
-        critic: TrainState,
-        alpha: TrainState,
-        batch: Dict[str, jax.Array],
-        beta: float,
-        metrics: Metrics
+        key: jax.random.PRNGKey,  # 随机数种子
+        actor: TrainState,         # 演员的训练状态
+        rnd: RNDTrainState,       # RND 训练状态
+        critic: TrainState,       # 评论家的训练状态
+        alpha: TrainState,        # 温度参数
+        batch: Dict[str, jax.Array],  # 批量数据
+        beta: float,              # RND 奖励的权重
+        metrics: Metrics          # 记录指标的对象
 ) -> Tuple[jax.random.PRNGKey, TrainState, jax.Array, Metrics]:
     key, actions_key, random_action_key = jax.random.split(key, 3)
 
     def actor_loss_fn(params):
+        # 计算演员的动作分布
         actions_dist = actor.apply_fn(params, batch["states"])
-        actions, actions_logp = actions_dist.sample_and_log_prob(seed=actions_key)
-
-        rnd_penalty = rnd_bonus(rnd, batch["states"], actions)
-        q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
+        actions, actions_logp = actions_dist.sample_and_log_prob(seed=actions_key)  # 采样动作和对数概率
+        rnd_penalty = rnd_bonus(rnd, batch["states"], actions)  # 计算 RND 奖励
+        q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)  # 计算评论家的 Q 值
+        # 计算演员的损失
         loss = (alpha.apply_fn(alpha.params) * actions_logp.sum(-1) + beta * rnd_penalty - q_values).mean()
-
-        # logging stuff
+        
+        # 记录熵和其他指标
         actor_entropy = -actions_logp.sum(-1).mean()
         random_actions = jax.random.uniform(random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0)
         new_metrics = metrics.update({
@@ -144,68 +143,63 @@ def update_actor(
         })
         return loss, (actor_entropy, new_metrics)
 
+    # 计算损失和梯度
     grads, (actor_entropy, new_metrics) = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
-    new_actor = actor.apply_gradients(grads=grads)
-
+    new_actor = actor.apply_gradients(grads=grads)  # 更新演员状态
     return key, new_actor, actor_entropy, new_metrics
 
-
 def update_alpha(
-        alpha: TrainState,
-        entropy: jax.Array,
-        target_entropy: float,
-        metrics: Metrics
+        alpha: TrainState,          # 温度参数的训练状态
+        entropy: jax.Array,        # 当前熵值
+        target_entropy: float,     # 目标熵值
+        metrics: Metrics            # 记录指标的对象
 ) -> Tuple[TrainState, Metrics]:
     def alpha_loss_fn(params):
-        alpha_value = alpha.apply_fn(params)
-        loss = (alpha_value * (entropy - target_entropy)).mean()
-
+        alpha_value = alpha.apply_fn(params)  # 获取当前的 alpha 值
+        loss = (alpha_value * (entropy - target_entropy)).mean()  # 计算损失
         new_metrics = metrics.update({
             "alpha": alpha_value,
             "alpha_loss": loss
         })
         return loss, new_metrics
 
+    # 计算梯度并更新 alpha
     grads, new_metrics = jax.grad(alpha_loss_fn, has_aux=True)(alpha.params)
     new_alpha = alpha.apply_gradients(grads=grads)
-
     return new_alpha, new_metrics
 
-
 def update_critic(
-        key: jax.random.PRNGKey,
-        actor: TrainState,
-        rnd: RNDTrainState,
-        critic: CriticTrainState,
-        alpha: TrainState,
-        batch: Dict[str, jax.Array],
-        gamma: float,
-        beta: float,
-        tau: float,
-        metrics: Metrics
+        key: jax.random.PRNGKey,  # 随机数种子
+        actor: TrainState,         # 演员的训练状态
+        rnd: RNDTrainState,       # RND 训练状态
+        critic: CriticTrainState, # 评论家的训练状态
+        alpha: TrainState,        # 温度参数
+        batch: Dict[str, jax.Array],  # 批量数据
+        gamma: float,             # 折扣因子
+        beta: float,              # RND 奖励的权重
+        tau: float,               # 目标网络更新的软更新参数
+        metrics: Metrics          # 记录指标的对象
 ) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
     key, actions_key = jax.random.split(key)
-
-    next_actions_dist = actor.apply_fn(actor.params, batch["next_states"])
-    next_actions, next_actions_logp = next_actions_dist.sample_and_log_prob(seed=actions_key)
-    rnd_penalty = rnd_bonus(rnd, batch["next_states"], next_actions)
-
-    next_q = critic.apply_fn(critic.target_params, batch["next_states"], next_actions).min(0)
-    next_q = next_q - alpha.apply_fn(alpha.params) * next_actions_logp.sum(-1) - beta * rnd_penalty
-
-    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
+    next_actions_dist = actor.apply_fn(actor.params, batch["next_states"])  # 计算下一状态的动作分布
+    next_actions, next_actions_logp = next_actions_dist.sample_and_log_prob(seed=actions_key)  # 采样下一状态的动作
+    rnd_penalty = rnd_bonus(rnd, batch["next_states"], next_actions)  # 计算 RND 奖励
+    next_q = critic.apply_fn(critic.target_params, batch["next_states"], next_actions).min(0)  # 计算下一状态的 Q 值
+    next_q = next_q - alpha.apply_fn(alpha.params) * next_actions_logp.sum(-1) - beta * rnd_penalty  # 计算目标 Q 值
+    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q  # 计算目标 Q 值
 
     def critic_loss_fn(critic_params):
-        # [N, batch_size] - [1, batch_size]
+        # 计算当前状态的 Q 值
         q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
-        q_min = q.min(0).mean()
-        loss = ((q - target_q[None, ...]) ** 2).mean(1).sum(0)
+        q_min = q.min(0).mean()  # 取最小 Q 值的平均
+        loss = ((q - target_q[None, ...]) ** 2).mean(1).sum(0)  # 计算损失
         return loss, q_min
 
+    # 计算损失和梯度
     (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
-    new_critic = critic.apply_gradients(grads=grads)
+    new_critic = critic.apply_gradients(grads=grads)  # 更新评论家状态
     new_critic = new_critic.replace(
-        target_params=optax.incremental_update(new_critic.params, new_critic.target_params, tau)
+        target_params=optax.incremental_update(new_critic.params, new_critic.target_params, tau)  # 更新目标网络
     )
     new_metrics = metrics.update({
         "critic_loss": loss,
