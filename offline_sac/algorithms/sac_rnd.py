@@ -209,56 +209,67 @@ def update_critic(
 
 
 def update_sac(
-        key: jax.random.PRNGKey,
-        rnd: RNDTrainState,
-        actor: TrainState,
-        critic: CriticTrainState,
-        alpha: TrainState,
-        batch: Dict[str, Any],
-        target_entropy: float,
-        gamma: float,
-        beta: float,
-        tau: float,
-        metrics: Metrics,
+        key: jax.random.PRNGKey,  # 随机数种子
+        rnd: RNDTrainState,        # RND 训练状态
+        actor: TrainState,         # 演员的训练状态
+        critic: CriticTrainState, # 评论家的训练状态
+        alpha: TrainState,        # 温度参数的训练状态
+        batch: Dict[str, Any],    # 批量数据
+        target_entropy: float,     # 目标熵值
+        gamma: float,              # 折扣因子
+        beta: float,               # RND 奖励的权重
+        tau: float,                # 目标网络更新的软更新参数
+        metrics: Metrics           # 记录指标的对象
 ):
+    # 更新演员并获取新的演员状态和熵
     key, new_actor, actor_entropy, new_metrics = update_actor(key, actor, rnd, critic, alpha, batch, beta, metrics)
+    
+    # 更新 alpha 参数
     new_alpha, new_metrics = update_alpha(alpha, actor_entropy, target_entropy, new_metrics)
+    
+    # 更新评论家并获取新的评论家状态
     key, new_critic, new_metrics = update_critic(
         key, new_actor, rnd, critic, alpha, batch, gamma, beta, tau, new_metrics
     )
-    return key, new_actor, new_critic, new_alpha, new_metrics
-
+    
+    return key, new_actor, new_critic, new_alpha, new_metrics  # 返回更新后的状态和指标
 
 def action_fn(actor: TrainState) -> Callable:
-    @jax.jit
+    @jax.jit  # JIT 编译加速
     def _action_fn(obs: jax.Array) -> jax.Array:
+        # 根据观察值计算动作分布
         dist = actor.apply_fn(actor.params, obs)
-        action = dist.mean()
+        action = dist.mean()  # 取动作分布的均值作为最终动作
         return action
-    return _action_fn
+    return _action_fn  # 返回动作计算函数
 
-
-@pyrallis.wrap()
+@pyrallis.wrap()  # 使用 Pyrallis 包装配置
 def main(config: Config):
+    # 初始化 Weights & Biases（WandB）用于实验跟踪
     wandb.init(
         config=asdict(config),
         project=config.project,
         group=config.group,
         name=config.name,
-        id=str(uuid.uuid4()),
+        id=str(uuid.uuid4()),  # 生成唯一 ID
     )
+    
+    # 创建重放缓冲区
     buffer = ReplayBuffer.create_from_d4rl(config.dataset_name, config.normalize_reward)
-    state_mean, state_std = buffer.get_moments("states")
-    action_mean, action_std = buffer.get_moments("actions")
-
+    state_mean, state_std = buffer.get_moments("states")  # 获取状态的均值和标准差
+    action_mean, action_std = buffer.get_moments("actions")  # 获取动作的均值和标准差
+    
+    # 初始化随机数种子
     key = jax.random.PRNGKey(seed=config.train_seed)
-    key, rnd_key, actor_key, critic_key, alpha_key = jax.random.split(key, 5)
-
+    key, rnd_key, actor_key, critic_key, alpha_key = jax.random.split(key, 5)  # 分割随机数种子
+    
+    # 创建评估环境
     eval_env = make_env(config.dataset_name, seed=config.eval_seed)
-    init_state = buffer.data["states"][0][None, ...]
-    init_action = buffer.data["actions"][0][None, ...]
-    target_entropy = -init_action.shape[-1]
-
+    init_state = buffer.data["states"][0][None, ...]  # 初始化状态
+    init_action = buffer.data["actions"][0][None, ...]  # 初始化动作
+    target_entropy = -init_action.shape[-1]  # 目标熵值
+    
+    # 初始化 RND 模块
     rnd_module = RND(
         hidden_dim=config.rnd_hidden_dim,
         embedding_dim=config.rnd_embedding_dim,
@@ -270,52 +281,61 @@ def main(config: Config):
         target_mlp_type=config.rnd_target_mlp_type,
         switch_features=config.rnd_switch_features
     )
+    
+    # 创建 RND 训练状态
     rnd = RNDTrainState.create(
         apply_fn=rnd_module.apply,
         params=rnd_module.init(rnd_key, init_state, init_action),
-        tx=optax.adam(learning_rate=config.rnd_learning_rate),
-        rms=RunningMeanStd.create()
+        tx=optax.adam(learning_rate=config.rnd_learning_rate),  # 使用 Adam 优化器
+        rms=RunningMeanStd.create()  # 创建均值和标准差跟踪器
     )
+    
+    # 初始化演员模块
     actor_module = Actor(action_dim=init_action.shape[-1], hidden_dim=config.hidden_dim)
     actor = TrainState.create(
         apply_fn=actor_module.apply,
         params=actor_module.init(actor_key, init_state),
-        tx=optax.adam(learning_rate=config.actor_learning_rate),
+        tx=optax.adam(learning_rate=config.actor_learning_rate),  # 使用 Adam 优化器
     )
+    
+    # 初始化 alpha 模块
     alpha_module = Alpha()
     alpha = TrainState.create(
         apply_fn=alpha_module.apply,
         params=alpha_module.init(alpha_key),
-        tx=optax.adam(learning_rate=config.alpha_learning_rate)
+        tx=optax.adam(learning_rate=config.alpha_learning_rate)  # 使用 Adam 优化器
     )
+    
+    # 初始化评论家模块
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim, num_critics=config.num_critics, layernorm=config.critic_layernorm
     )
     critic = CriticTrainState.create(
         apply_fn=critic_module.apply,
         params=critic_module.init(critic_key, init_state, init_action),
-        target_params=critic_module.init(critic_key, init_state, init_action),
-        tx=optax.adam(learning_rate=config.critic_learning_rate),
+        target_params=critic_module.init(critic_key, init_state, init_action),  # 初始化目标参数
+        tx=optax.adam(learning_rate=config.critic_learning_rate),  # 使用 Adam 优化器
     )
-
+    
+    # 部分应用 update_sac 函数，固定一些参数
     update_sac_partial = partial(
         update_sac, target_entropy=target_entropy, gamma=config.gamma, beta=config.beta, tau=config.tau
     )
-
+    
+    # RND 更新步骤
     def rnd_loop_update_step(i, carry):
-        key, batch_key = jax.random.split(carry["key"])
-        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
-
-        key, new_rnd, new_metrics = update_rnd(key, carry["rnd"], batch, carry["metrics"])
+        key, batch_key = jax.random.split(carry["key"])  # 分割随机数种子
+        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)  # 从缓冲区采样批量数据
+        key, new_rnd, new_metrics = update_rnd(key, carry["rnd"], batch, carry["metrics"])  # 更新 RND
         carry.update(
-            key=key, rnd=new_rnd, metrics=new_metrics
+            key=key, rnd=new_rnd, metrics=new_metrics  # 更新携带的状态
         )
         return carry
-
+    
+    # SAC 更新步骤
     def sac_loop_update_step(i, carry):
-        key, batch_key = jax.random.split(carry["key"])
-        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
-
+        key, batch_key = jax.random.split(carry["key"])  # 分割随机数种子
+        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)  # 从缓冲区采样批量数据
         key, new_actor, new_critic, new_alpha, new_metrics = update_sac_partial(
             key=key,
             rnd=carry["rnd"],
@@ -324,13 +344,13 @@ def main(config: Config):
             alpha=carry["alpha"],
             batch=batch,
             metrics=carry["metrics"]
-        )
+        )  # 更新 SAC
         carry.update(
-            key=key, actor=new_actor, critic=new_critic, alpha=new_alpha, metrics=new_metrics
+            key=key, actor=new_actor, critic=new_critic, alpha=new_alpha, metrics=new_metrics  # 更新携带的状态
         )
         return carry
-
-    # metrics
+    
+    # 指标记录
     rnd_metrics_to_log = [
         "rnd_loss", "rnd_rms", "rnd_data", "rnd_random"
     ]
@@ -338,7 +358,8 @@ def main(config: Config):
         "critic_loss", "q_min", "actor_loss", "batch_entropy",
         "rnd_policy", "rnd_random", "action_mse", "alpha_loss", "alpha"
     ]
-    # shared carry for update loops
+    
+    # 更新循环的共享携带状态
     update_carry = {
         "key": key,
         "actor": actor,
@@ -347,10 +368,10 @@ def main(config: Config):
         "alpha": alpha,
         "buffer": buffer,
     }
-    # PRETRAIN RND
-    # for epoch in trange(config.rnd_update_epochs, desc="RND Epochs"):
+    
+    # 预训练 RND
     for epoch in range(config.rnd_update_epochs):
-        # metrics for accumulation during epoch and logging to wandb, we need to reset them every epoch
+        # 每个 epoch 的指标累积和记录
         update_carry["metrics"] = Metrics.create(rnd_metrics_to_log)
         update_carry = jax.lax.fori_loop(
             lower=0,
@@ -358,14 +379,13 @@ def main(config: Config):
             body_fun=rnd_loop_update_step,
             init_val=update_carry
         )
-        # log mean over epoch for each metric
+        # 记录每个指标的平均值
         mean_metrics = update_carry["metrics"].compute()
         wandb.log({"epoch": epoch, **{f"RND/{k}": v for k, v in mean_metrics.items()}})
-
-    # TRAIN BC
-    # for epoch in trange(config.num_epochs, desc="SAC Epochs"):
+    
+    # 训练 BC
     for epoch in range(config.num_epochs):
-        # metrics for accumulation during epoch and logging to wandb, we need to reset them every epoch
+        # 每个 epoch 的指标累积和记录
         update_carry["metrics"] = Metrics.create(bc_metrics_to_log)
         update_carry = jax.lax.fori_loop(
             lower=0,
@@ -373,15 +393,15 @@ def main(config: Config):
             body_fun=sac_loop_update_step,
             init_val=update_carry
         )
-        # log mean over epoch for each metric
+        # 记录每个指标的平均值
         mean_metrics = update_carry["metrics"].compute()
         wandb.log({"epoch": epoch, **{f"SAC/{k}": v for k, v in mean_metrics.items()}})
-
+        
+        # 每隔一定的 epoch 进行评估
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-            actor_action_fn = action_fn(actor=update_carry["actor"])
-
-            eval_returns = evaluate(eval_env, actor_action_fn, config.eval_episodes, seed=config.eval_seed)
-            normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+            actor_action_fn = action_fn(actor=update_carry["actor"])  # 获取动作函数
+            eval_returns = evaluate(eval_env, actor_action_fn, config.eval_episodes, seed=config.eval_seed)  # 进行评估
+            normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0  # 计算标准化得分
             wandb.log({
                 "epoch": epoch,
                 "eval/return_mean": np.mean(eval_returns),
@@ -389,8 +409,8 @@ def main(config: Config):
                 "eval/normalized_score_mean": np.mean(normalized_score),
                 "eval/normalized_score_std": np.std(normalized_score)
             })
-
-    wandb.finish()
+    
+    wandb.finish()  # 完成 WandB 记录
 
 
 if __name__ == "__main__":
